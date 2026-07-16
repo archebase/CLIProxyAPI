@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -88,7 +89,7 @@ func TestEmbeddedRuntimeExecuteResolvedAnthropicUsesExactVersionedPrefix(t *test
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path = r.URL.Path
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg-ok","type":"message","content":[]}`))
+		_, _ = w.Write([]byte(`{"id":"msg-ok","type":"message","content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"ok"}],"stop_reason":"thinking_end"}`))
 	}))
 	defer upstream.Close()
 
@@ -107,8 +108,105 @@ func TestEmbeddedRuntimeExecuteResolvedAnthropicUsesExactVersionedPrefix(t *test
 	if err != nil {
 		t.Fatalf("ExecuteResolved: %v", err)
 	}
-	if path != "/api/anthropic/v1/messages" || !strings.Contains(string(resp.Payload), "msg-ok") {
+	if path != "/api/anthropic/v1/messages" || !strings.Contains(string(resp.Payload), "msg-ok") || strings.Contains(string(resp.Payload), `"type":"thinking"`) || !strings.Contains(string(resp.Payload), `"stop_reason":"end_turn"`) {
 		t.Fatalf("path=%q payload=%s", path, resp.Payload)
+	}
+}
+
+func TestEmbeddedRuntimeExecuteResolvedStreamStripsZhipuClaudeThinkingAndPreservesSSE(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			`event: message_start`,
+			`data: {"type":"message_start","message":{"id":"msg-1","model":"glm-5.2"}}`,
+			``,
+			`event: content_block_start`,
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+			``,
+			`event: content_block_delta`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hidden"}}`,
+			``,
+			`event: content_block_stop`,
+			`data: {"type":"content_block_stop","index":0}`,
+			``,
+			`event: content_block_start`,
+			`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+			``,
+			`event: content_block_delta`,
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ok"}}`,
+			``,
+			`event: content_block_stop`,
+			`data: {"type":"content_block_stop","index":1}`,
+			``,
+			`event: message_delta`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"thinking_end"}}`,
+			``,
+			`event: message_stop`,
+			`data: {"type":"message_stop"}`,
+			``,
+		}, "\n") + "\n"))
+	}))
+	defer upstream.Close()
+	runtime := resolvedTestRuntime(t)
+	result, err := runtime.ExecuteResolvedStream(t.Context(), ResolvedExecutionRequest{
+		Executor:   NativeExecutorAnthropic,
+		Provider:   "zhipu",
+		Candidates: []ResolvedExecutionCandidate{{Auth: &coreauth.Auth{Attributes: map[string]string{"api_key": "key"}}, RuntimeModel: "glm-5.2", APIBase: upstream.URL}},
+		Request:    cliproxyexecutor.Request{Payload: []byte(`{"messages":[],"max_tokens":16,"stream":true}`), Format: cliproxytranslator.FormatClaude},
+		Options:    cliproxyexecutor.Options{Stream: true, SourceFormat: cliproxytranslator.FormatClaude},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteResolvedStream: %v", err)
+	}
+	var payload strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("chunk: %v", chunk.Err)
+		}
+		payload.Write(chunk.Payload)
+	}
+	if strings.Contains(payload.String(), "thinking") || !strings.Contains(payload.String(), `"type":"text"`) || !strings.Contains(payload.String(), `"text":"ok"`) || !strings.Contains(payload.String(), `"stop_reason":"end_turn"`) || strings.Contains(payload.String(), `"index":1`) || !strings.Contains(payload.String(), `"index":0`) || !strings.HasSuffix(payload.String(), "\n\n") {
+		t.Fatalf("payload=%q", payload.String())
+	}
+}
+
+func TestEmbeddedRuntimeDoesNotRetryAfterHiddenZhipuStreamChunk(t *testing.T) {
+	var secondCalls atomic.Int32
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetRoundTripperProvider(roundTripperProviderFunc(func(auth *coreauth.Auth) http.RoundTripper {
+		return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if auth.ID == "second" {
+				secondCalls.Add(1)
+			}
+			body := io.ReadCloser(&errorAfterReader{
+				reader: strings.NewReader("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n"),
+				err:    errors.New("upstream stream failed"),
+			})
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body, Request: req}, nil
+		})
+	}))
+	runtime, err := NewEmbeddedRuntime(&config.Config{}, manager)
+	if err != nil {
+		t.Fatalf("NewEmbeddedRuntime: %v", err)
+	}
+	if err := runtime.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	_, err = runtime.ExecuteResolvedStream(t.Context(), ResolvedExecutionRequest{
+		Executor: NativeExecutorAnthropic,
+		Provider: "zhipu",
+		Candidates: []ResolvedExecutionCandidate{
+			{Auth: &coreauth.Auth{ID: "first", Attributes: map[string]string{"api_key": "one"}}, RuntimeModel: "glm-5.2", APIBase: "https://first.invalid"},
+			{Auth: &coreauth.Auth{ID: "second", Attributes: map[string]string{"api_key": "two"}}, RuntimeModel: "glm-5.2", APIBase: "https://second.invalid"},
+		},
+		Request: cliproxyexecutor.Request{Payload: []byte(`{"messages":[],"max_tokens":16,"stream":true}`), Format: cliproxytranslator.FormatClaude},
+		Options: cliproxyexecutor.Options{Stream: true, SourceFormat: cliproxytranslator.FormatClaude},
+	})
+	if err == nil || !strings.Contains(err.Error(), "upstream stream failed") {
+		t.Fatalf("error=%v", err)
+	}
+	if secondCalls.Load() != 0 {
+		t.Fatalf("second credential calls=%d", secondCalls.Load())
 	}
 }
 
@@ -385,6 +483,20 @@ func (f roundTripperProviderFunc) RoundTripperFor(auth *coreauth.Auth) http.Roun
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type errorAfterReader struct {
+	reader *strings.Reader
+	err    error
+}
+
+func (r *errorAfterReader) Read(payload []byte) (int, error) {
+	if r.reader.Len() > 0 {
+		return r.reader.Read(payload)
+	}
+	return 0, r.err
+}
+
+func (*errorAfterReader) Close() error { return nil }
 
 func resolvedTestRuntime(t *testing.T) *EmbeddedRuntime {
 	t.Helper()

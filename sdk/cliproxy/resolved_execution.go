@@ -1,7 +1,9 @@
 package cliproxy
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -51,9 +53,11 @@ func (r *EmbeddedRuntime) ExecuteResolved(ctx context.Context, execution Resolve
 	for _, candidate := range candidates {
 		req := execution.Request
 		req.Model = candidate.RuntimeModel
+		normalizer := newResolvedProviderResponseNormalizer(execution.Provider, execution.Executor, cliproxyexecutor.ResponseFormatOrSource(execution.Options))
 		execCtx, execReq, execOpts := r.prepareResolvedRequest(ctx, candidate, req, execution.Options, execution.Executor, execution.Request.Model)
 		resp, errExec := executor.Execute(execCtx, candidate.Auth, execReq, execOpts)
 		if errExec == nil {
+			resp.Payload = normalizer.Normalize(resp.Payload)
 			return resp, nil
 		}
 		if err := ctx.Err(); err != nil {
@@ -84,6 +88,7 @@ func (r *EmbeddedRuntime) ExecuteResolvedStream(ctx context.Context, execution R
 	for _, candidate := range candidates {
 		req := execution.Request
 		req.Model = candidate.RuntimeModel
+		normalizer := newResolvedProviderResponseNormalizer(execution.Provider, execution.Executor, cliproxyexecutor.ResponseFormatOrSource(execution.Options))
 		execCtx, execReq, execOpts := r.prepareResolvedRequest(ctx, candidate, req, execution.Options, execution.Executor, execution.Request.Model)
 		result, errExec := executor.ExecuteStream(execCtx, candidate.Auth, execReq, execOpts)
 		if errExec == nil {
@@ -102,6 +107,22 @@ func (r *EmbeddedRuntime) ExecuteResolvedStream(ctx context.Context, execution R
 				}
 				lastErr = first.Err
 				continue
+			}
+			for ok {
+				first.Payload = normalizer.Normalize(first.Payload)
+				if len(first.Payload) > 0 {
+					break
+				}
+				select {
+				case first, ok = <-result.Chunks:
+					if ok && first.Err != nil {
+						finish()
+						return nil, first.Err
+					}
+				case <-ctx.Done():
+					finish()
+					return nil, ctx.Err()
+				}
 			}
 			forwarded := make(chan cliproxyexecutor.StreamChunk)
 			go func() {
@@ -124,6 +145,17 @@ func (r *EmbeddedRuntime) ExecuteResolvedStream(ctx context.Context, execution R
 						}
 					case <-ctx.Done():
 						return
+					}
+					if chunk.Err != nil {
+						select {
+						case forwarded <- chunk:
+						case <-ctx.Done():
+						}
+						return
+					}
+					chunk.Payload = normalizer.Normalize(chunk.Payload)
+					if len(chunk.Payload) == 0 {
+						continue
 					}
 					select {
 					case forwarded <- chunk:
@@ -149,6 +181,152 @@ func (r *EmbeddedRuntime) ExecuteResolvedStream(ctx context.Context, execution R
 		return nil, lastErr
 	}
 	return nil, &coreauth.Error{Code: "auth_not_found", Message: fmt.Sprintf("no %s auth available", provider)}
+}
+
+type resolvedProviderResponseNormalizer struct {
+	stripClaudeThinking bool
+	thinkingIndexes     map[int64]struct{}
+	suppressedIndexes   map[int64]struct{}
+}
+
+func newResolvedProviderResponseNormalizer(provider string, executor NativeExecutorKind, responseFormat sdktranslator.Format) *resolvedProviderResponseNormalizer {
+	strip := strings.EqualFold(strings.TrimSpace(provider), "zhipu") && executor == NativeExecutorAnthropic && responseFormat == sdktranslator.FormatClaude
+	return &resolvedProviderResponseNormalizer{stripClaudeThinking: strip, thinkingIndexes: make(map[int64]struct{}), suppressedIndexes: make(map[int64]struct{})}
+}
+
+func (n *resolvedProviderResponseNormalizer) Normalize(payload []byte) []byte {
+	if n == nil || !n.stripClaudeThinking {
+		return payload
+	}
+	return n.stripClaudeThinkingPayload(payload)
+}
+
+func (n *resolvedProviderResponseNormalizer) stripClaudeThinkingPayload(payload []byte) []byte {
+	if len(payload) == 0 {
+		return payload
+	}
+	jsonStart := 0
+	jsonEnd := len(payload)
+	if dataOffset := sseResolvedDataOffset(payload); dataOffset >= 0 {
+		jsonStart = bytes.IndexByte(payload[dataOffset:], '{')
+		if jsonStart < 0 {
+			return payload
+		}
+		jsonStart += dataOffset
+		lineEnd := bytes.IndexByte(payload[jsonStart:], '\n')
+		if lineEnd >= 0 {
+			jsonEnd = jsonStart + lineEnd
+		}
+	}
+	jsonPayload := bytes.TrimSpace(payload[jsonStart:jsonEnd])
+	var message map[string]any
+	if err := json.Unmarshal(jsonPayload, &message); err != nil {
+		return payload
+	}
+	changed := false
+	eventType, _ := message["type"].(string)
+	index := resolvedJSONInt64(message["index"])
+	switch eventType {
+	case "content_block_start":
+		block, _ := message["content_block"].(map[string]any)
+		blockType, _ := block["type"].(string)
+		if blockType == "thinking" || blockType == "redacted_thinking" {
+			n.thinkingIndexes[index] = struct{}{}
+			n.suppressedIndexes[index] = struct{}{}
+			return nil
+		}
+	case "content_block_delta":
+		delta, _ := message["delta"].(map[string]any)
+		deltaType, _ := delta["type"].(string)
+		_, suppressed := n.thinkingIndexes[index]
+		if suppressed || deltaType == "thinking_delta" || deltaType == "signature_delta" {
+			n.thinkingIndexes[index] = struct{}{}
+			return nil
+		}
+	case "content_block_stop":
+		if _, suppressed := n.thinkingIndexes[index]; suppressed {
+			delete(n.thinkingIndexes, index)
+			return nil
+		}
+	}
+	if _, hasIndex := message["index"]; hasIndex {
+		message["index"] = index - n.suppressedBefore(index)
+		changed = true
+	}
+	if content, ok := message["content"].([]any); ok {
+		filtered := make([]any, 0, len(content))
+		for _, item := range content {
+			block, isBlock := item.(map[string]any)
+			blockType, _ := block["type"].(string)
+			if isBlock && (blockType == "thinking" || blockType == "redacted_thinking") {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		if changed {
+			message["content"] = filtered
+		}
+	}
+	if stopReason, ok := message["stop_reason"].(string); ok && strings.Contains(strings.ToLower(stopReason), "thinking") {
+		message["stop_reason"] = "end_turn"
+		changed = true
+	}
+	if delta, ok := message["delta"].(map[string]any); ok {
+		if stopReason, ok := delta["stop_reason"].(string); ok && strings.Contains(strings.ToLower(stopReason), "thinking") {
+			delta["stop_reason"] = "end_turn"
+			changed = true
+		}
+	}
+	if !changed {
+		return payload
+	}
+	cleaned, err := json.Marshal(message)
+	if err != nil {
+		return payload
+	}
+	out := make([]byte, 0, len(payload)-len(jsonPayload)+len(cleaned))
+	out = append(out, payload[:jsonStart]...)
+	out = append(out, cleaned...)
+	out = append(out, payload[jsonEnd:]...)
+	return out
+}
+
+func (n *resolvedProviderResponseNormalizer) suppressedBefore(index int64) int64 {
+	var count int64
+	for suppressed := range n.suppressedIndexes {
+		if suppressed < index {
+			count++
+		}
+	}
+	return count
+}
+
+func resolvedJSONInt64(value any) int64 {
+	switch typed := value.(type) {
+	case float64:
+		return int64(typed)
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func sseResolvedDataOffset(payload []byte) int {
+	for offset := 0; offset < len(payload); {
+		lineEnd := bytes.IndexByte(payload[offset:], '\n')
+		if lineEnd < 0 {
+			lineEnd = len(payload) - offset
+		}
+		line := bytes.TrimSpace(payload[offset : offset+lineEnd])
+		if bytes.HasPrefix(line, []byte("data:")) {
+			return offset
+		}
+		offset += lineEnd + 1
+	}
+	return -1
 }
 
 type preparedResolvedCandidate struct {

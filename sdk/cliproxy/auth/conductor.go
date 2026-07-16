@@ -4630,6 +4630,21 @@ func (m *Manager) Executor(provider string) (ProviderExecutor, bool) {
 	return executor, true
 }
 
+// RoundTripperFor returns the host-configured transport for an auth.
+// Embedded SDK hosts use WithRoundTripper to preserve egress policy without
+// depending on the auth package's private context key.
+func (m *Manager) RoundTripperFor(auth *Auth) http.RoundTripper {
+	return m.roundTripperFor(auth)
+}
+
+func WithRoundTripper(ctx context.Context, rt http.RoundTripper) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = context.WithValue(ctx, roundTripperContextKey{}, rt)
+	return context.WithValue(ctx, "cliproxy.roundtripper", rt)
+}
+
 // CloseExecutionSession asks all registered executors to release the supplied execution session.
 func (m *Manager) CloseExecutionSession(sessionID string) {
 	sessionID = strings.TrimSpace(sessionID)

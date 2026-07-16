@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -32,6 +33,7 @@ type EmbeddedRuntime struct {
 	resolvedClosing  bool
 	resolvedInflight int
 	resolvedDrained  chan struct{}
+	resolvedSequence atomic.Uint64
 }
 
 const embeddedRuntimeRefreshInterval = 15 * time.Minute

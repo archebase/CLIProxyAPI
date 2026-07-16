@@ -376,7 +376,12 @@ func RegisterPlugin(plugin Plugin) { DefaultManager().Register(plugin) }
 func RegisterNamedPlugin(name string, plugin Plugin) { DefaultManager().RegisterNamed(name, plugin) }
 
 // PublishRecord publishes a record using the default manager.
-func PublishRecord(ctx context.Context, record Record) { DefaultManager().Publish(ctx, record) }
+func PublishRecord(ctx context.Context, record Record) {
+	if PublishingSuppressed(ctx) {
+		return
+	}
+	DefaultManager().Publish(ctx, record)
+}
 
 // StartDefault starts the default manager's dispatcher.
 func StartDefault(ctx context.Context) { DefaultManager().Start(ctx) }

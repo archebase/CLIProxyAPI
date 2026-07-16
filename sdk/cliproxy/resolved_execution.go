@@ -10,6 +10,8 @@ import (
 	nativeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 type NativeExecutorKind string
@@ -47,7 +49,8 @@ func (r *EmbeddedRuntime) ExecuteResolved(ctx context.Context, execution Resolve
 	for _, candidate := range candidates {
 		req := execution.Request
 		req.Model = candidate.RuntimeModel
-		resp, errExec := executor.Execute(ctx, candidate.Auth, req, execution.Options)
+		execCtx, execReq, execOpts := r.prepareResolvedRequest(ctx, candidate, req, execution.Options, execution.Executor, execution.Request.Model)
+		resp, errExec := executor.Execute(execCtx, candidate.Auth, execReq, execOpts)
 		if errExec == nil {
 			return resp, nil
 		}
@@ -79,7 +82,8 @@ func (r *EmbeddedRuntime) ExecuteResolvedStream(ctx context.Context, execution R
 	for _, candidate := range candidates {
 		req := execution.Request
 		req.Model = candidate.RuntimeModel
-		result, errExec := executor.ExecuteStream(ctx, candidate.Auth, req, execution.Options)
+		execCtx, execReq, execOpts := r.prepareResolvedRequest(ctx, candidate, req, execution.Options, execution.Executor, execution.Request.Model)
+		result, errExec := executor.ExecuteStream(execCtx, candidate.Auth, execReq, execOpts)
 		if errExec == nil {
 			first, ok := <-result.Chunks
 			if ok && first.Err != nil {
@@ -129,8 +133,9 @@ func (r *EmbeddedRuntime) ExecuteResolvedStream(ctx context.Context, execution R
 }
 
 type preparedResolvedCandidate struct {
-	Auth         *coreauth.Auth
-	RuntimeModel string
+	Auth          *coreauth.Auth
+	TransportAuth *coreauth.Auth
+	RuntimeModel  string
 }
 
 func (r *EmbeddedRuntime) prepareResolvedCandidates(execution ResolvedExecutionRequest) (coreauth.ProviderExecutor, string, []preparedResolvedCandidate, error) {
@@ -151,6 +156,7 @@ func (r *EmbeddedRuntime) prepareResolvedCandidates(execution ResolvedExecutionR
 	default:
 		return nil, "", nil, fmt.Errorf("cliproxy: unsupported resolved executor %q", execution.Executor)
 	}
+	sequence := r.resolvedSequence.Add(1)
 	candidates := make([]preparedResolvedCandidate, 0, len(execution.Candidates))
 	for index, candidate := range execution.Candidates {
 		if candidate.Auth == nil {
@@ -168,20 +174,95 @@ func (r *EmbeddedRuntime) prepareResolvedCandidates(execution ResolvedExecutionR
 		if apiKey == "" {
 			return nil, "", nil, fmt.Errorf("cliproxy: resolved API key is required")
 		}
-		auth := &coreauth.Auth{
-			ID:       fmt.Sprintf("resolved-%d", index),
-			Provider: provider,
-			Label:    candidate.Auth.Label,
-			Status:   coreauth.StatusActive,
-			ProxyURL: candidate.Auth.ProxyURL,
-			Attributes: map[string]string{
-				"api_key":  apiKey,
-				"base_url": apiBase,
-			},
+		transportAuth := candidate.Auth.Clone()
+		auth := candidate.Auth.Clone()
+		if strings.TrimSpace(auth.ID) == "" {
+			auth.ID = fmt.Sprintf("resolved-%p-%d-%d", r, sequence, index)
+			transportAuth.ID = auth.ID
 		}
-		candidates = append(candidates, preparedResolvedCandidate{Auth: auth, RuntimeModel: model})
+		auth.Provider = provider
+		auth.Status = coreauth.StatusActive
+		if auth.Attributes == nil {
+			auth.Attributes = make(map[string]string)
+		}
+		auth.Attributes["api_key"] = apiKey
+		auth.Attributes["base_url"] = apiBase
+		candidates = append(candidates, preparedResolvedCandidate{Auth: auth, TransportAuth: transportAuth, RuntimeModel: model})
 	}
 	return executor, provider, candidates, nil
+}
+
+func (r *EmbeddedRuntime) prepareResolvedRequest(ctx context.Context, candidate preparedResolvedCandidate, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, kind NativeExecutorKind, requestedModel string) (context.Context, cliproxyexecutor.Request, cliproxyexecutor.Options) {
+	ctx = coreusage.WithPublishingSuppressed(ctx)
+	if r.manager != nil {
+		if roundTripper := r.manager.RoundTripperFor(candidate.TransportAuth); roundTripper != nil {
+			ctx = coreauth.WithRoundTripper(ctx, roundTripper)
+		}
+	}
+	if opts.RequestAfterAuthInterceptor == nil {
+		return ctx, req, opts
+	}
+	opts.Headers = opts.Headers.Clone()
+	if opts.Headers == nil {
+		opts.Headers = make(http.Header)
+	}
+	toFormat := sdktranslator.FormatOpenAI
+	if kind == NativeExecutorAnthropic {
+		toFormat = sdktranslator.FormatClaude
+	}
+	intercepted := opts.RequestAfterAuthInterceptor(ctx, cliproxyexecutor.RequestAfterAuthInterceptRequest{
+		SourceFormat:   opts.SourceFormat,
+		ToFormat:       toFormat,
+		Model:          req.Model,
+		RequestedModel: resolvedRequestedModel(opts, requestedModel),
+		Stream:         opts.Stream,
+		Headers:        opts.Headers.Clone(),
+		Body:           append([]byte(nil), req.Payload...),
+		Metadata:       cloneResolvedMetadata(opts.Metadata),
+	})
+	for _, key := range intercepted.ClearHeaders {
+		opts.Headers.Del(key)
+	}
+	for key, values := range intercepted.Headers {
+		opts.Headers.Del(key)
+		for _, value := range values {
+			opts.Headers.Add(key, value)
+		}
+	}
+	if len(intercepted.Body) > 0 {
+		req.Payload = append([]byte(nil), intercepted.Body...)
+		opts.OriginalRequest = append([]byte(nil), intercepted.Body...)
+	}
+	return ctx, req, opts
+}
+
+func resolvedRequestedModel(opts cliproxyexecutor.Options, fallback string) string {
+	fallback = strings.TrimSpace(fallback)
+	if len(opts.Metadata) == 0 {
+		return fallback
+	}
+	switch value := opts.Metadata[cliproxyexecutor.RequestedModelMetadataKey].(type) {
+	case string:
+		if requested := strings.TrimSpace(value); requested != "" {
+			return requested
+		}
+	case []byte:
+		if requested := strings.TrimSpace(string(value)); requested != "" {
+			return requested
+		}
+	}
+	return fallback
+}
+
+func cloneResolvedMetadata(metadata map[string]any) map[string]any {
+	if metadata == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func (r *EmbeddedRuntime) beginResolvedExecution(ctx context.Context) (context.Context, func(), error) {

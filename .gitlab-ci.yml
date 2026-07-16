@@ -1,11 +1,12 @@
 stages:
   - verify
 
+variables:
+  GOPROXY: https://goproxy.cn,direct
+  GOFLAGS: -buildvcs=false
+
 default:
   image: docker.m.daocloud.io/library/golang:1.26-bookworm
-  variables:
-    GOPROXY: https://goproxy.cn,direct
-    GOFLAGS: -buildvcs=false
   cache:
     key: go-mod-${CI_COMMIT_REF_SLUG}
     paths:

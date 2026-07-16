@@ -414,12 +414,13 @@ func TestTranslateNonStreamNormalizesRequestedModelWithoutNativeTransformer(t *t
 
 func TestTranslateStreamNormalizesNestedRequestedModelAndPreservesFraming(t *testing.T) {
 	r := NewRegistry()
-	input := []byte("data: {\"type\":\"response.completed\",\"response\":{\"model\":\"physical-model\"}}\n\n")
+	input := []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"physical-model\"}}\n\n")
 	got := r.TranslateStream(context.Background(), FormatOpenAIResponse, FormatOpenAIResponse, "canonical-model", nil, nil, input, nil)
 	if len(got) != 1 || !bytes.HasSuffix(got[0], []byte("\n\n")) {
 		t.Fatalf("stream framing=%q", got)
 	}
-	payload := bytes.TrimSpace(bytes.TrimPrefix(bytes.TrimSpace(got[0]), []byte("data:")))
+	dataOffset := bytes.Index(got[0], []byte("data:"))
+	payload := bytes.TrimSpace(got[0][dataOffset+len("data:"):])
 	if model := gjson.GetBytes(payload, "response.model").String(); model != "canonical-model" {
 		t.Fatalf("model=%q payload=%s", model, payload)
 	}

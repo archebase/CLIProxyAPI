@@ -1237,9 +1237,13 @@ func TestClaudeExecutor_ExecuteStreamStripsOpenAIEncryptedThinkingBeforeUpstream
 }
 
 func TestClaudeExecutor_ExecuteStreamDirectPassthroughEmitsCompleteSSEEvents(t *testing.T) {
+	startData := `{"type":"message_start","message":{"id":"msg_1","model":"physical-model"}}`
 	firstData := `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`
 	secondData := `{"type":"message_stop"}`
-	upstreamStream := "event: content_block_delta\n" +
+	upstreamStream := "event: message_start\n" +
+		"data: " + startData + "\n" +
+		"\n" +
+		"event: content_block_delta\n" +
 		"data: " + firstData + "\n" +
 		"\n" +
 		"event: message_stop\n" +
@@ -1262,7 +1266,10 @@ func TestClaudeExecutor_ExecuteStreamDirectPassthroughEmitsCompleteSSEEvents(t *
 	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "claude-3-5-sonnet-20241022",
 		Payload: payload,
-	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Metadata:     map[string]any{cliproxyexecutor.RequestedModelMetadataKey: "canonical-model"},
+	})
 	if err != nil {
 		t.Fatalf("ExecuteStream() error = %v", err)
 	}
@@ -1276,6 +1283,7 @@ func TestClaudeExecutor_ExecuteStreamDirectPassthroughEmitsCompleteSSEEvents(t *
 	}
 
 	want := []string{
+		"event: message_start\n" + "data: " + strings.Replace(startData, "physical-model", "canonical-model", 1) + "\n\n",
 		"event: content_block_delta\n" + "data: " + firstData + "\n\n",
 		"event: message_stop\n" + "data: " + secondData + "\n\n",
 	}

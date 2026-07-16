@@ -552,18 +552,22 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			var event bytes.Buffer
+			var param any
 			flushEvent := func() bool {
 				if event.Len() == 0 {
 					return true
 				}
 				cloned := bytes.Clone(event.Bytes())
 				event.Reset()
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: cloned}:
-					return true
-				case <-ctx.Done():
-					return false
+				chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, requestedModel, opts.OriginalRequest, bodyForTranslation, cloned, &param)
+				for i := range chunks {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+					case <-ctx.Done():
+						return false
+					}
 				}
+				return true
 			}
 			for scanner.Scan() {
 				line := scanner.Bytes()

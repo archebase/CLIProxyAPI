@@ -216,24 +216,24 @@ func normalizeResponseModel(body []byte, model string, stream bool) []byte {
 	if !stream {
 		return normalizeJSONResponseModel(body, model)
 	}
-	trimmed := bytes.TrimSpace(body)
-	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+	dataOffset := sseDataOffset(body)
+	if dataOffset < 0 {
 		return normalizeJSONResponseModel(body, model)
 	}
-	payloadOffset := bytes.Index(body, []byte("data:")) + len("data:")
+	payloadOffset := dataOffset + len("data:")
 	for payloadOffset < len(body) && (body[payloadOffset] == ' ' || body[payloadOffset] == '\t') {
 		payloadOffset++
 	}
 	payloadEnd := len(body)
-	for payloadEnd > payloadOffset {
-		switch body[payloadEnd-1] {
-		case '\r', '\n', ' ', '\t':
-			payloadEnd--
-		default:
-			goto payloadReady
-		}
+	if lineEnd := bytes.IndexByte(body[payloadOffset:], '\n'); lineEnd >= 0 {
+		payloadEnd = payloadOffset + lineEnd
 	}
-payloadReady:
+	if payloadEnd > payloadOffset && body[payloadEnd-1] == '\r' {
+		payloadEnd--
+	}
+	for payloadEnd > payloadOffset && (body[payloadEnd-1] == ' ' || body[payloadEnd-1] == '\t') {
+		payloadEnd--
+	}
 	payload := body[payloadOffset:payloadEnd]
 	if bytes.Equal(payload, []byte("[DONE]")) {
 		return body
@@ -247,6 +247,21 @@ payloadReady:
 	out = append(out, updated...)
 	out = append(out, body[payloadEnd:]...)
 	return out
+}
+
+func sseDataOffset(body []byte) int {
+	for offset := 0; offset < len(body); {
+		lineEnd := bytes.IndexByte(body[offset:], '\n')
+		if lineEnd < 0 {
+			lineEnd = len(body) - offset
+		}
+		line := bytes.TrimSpace(body[offset : offset+lineEnd])
+		if bytes.HasPrefix(line, []byte("data:")) {
+			return offset + bytes.Index(body[offset:offset+lineEnd], []byte("data:"))
+		}
+		offset += lineEnd + 1
+	}
+	return -1
 }
 
 func normalizeJSONResponseModel(body []byte, model string) []byte {

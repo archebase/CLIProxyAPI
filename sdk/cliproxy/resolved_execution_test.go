@@ -262,9 +262,13 @@ func TestEmbeddedRuntimeExecuteResolvedAppliesInterceptorAndHostRoundTripper(t *
 		t.Fatalf("Start: %v", err)
 	}
 	callerHeaders := http.Header{"X-Caller": []string{"preserved"}}
+	nestedMap := map[string]string{"id": "project-1"}
+	nestedPointer := &struct{ Value string }{Value: "original"}
 	callerMetadata := map[string]any{
 		cliproxyexecutor.RequestedModelMetadataKey: "canonical-model",
-		"project": map[string]any{"id": "project-1"},
+		"project":   map[string]any{"id": "project-1"},
+		"typed_map": nestedMap,
+		"pointer":   nestedPointer,
 	}
 	candidateAuth := &coreauth.Auth{
 		ID:       "credential-17",
@@ -288,6 +292,8 @@ func TestEmbeddedRuntimeExecuteResolvedAppliesInterceptorAndHostRoundTripper(t *
 			RequestAfterAuthInterceptor: func(_ context.Context, input cliproxyexecutor.RequestAfterAuthInterceptRequest) cliproxyexecutor.RequestAfterAuthInterceptResponse {
 				gotIntercept = input
 				input.Metadata["project"].(map[string]any)["id"] = "mutated"
+				input.Metadata["typed_map"].(map[string]string)["id"] = "mutated"
+				input.Metadata["pointer"].(*struct{ Value string }).Value = "mutated"
 				return cliproxyexecutor.RequestAfterAuthInterceptResponse{Headers: http.Header{"X-Resolved-Policy": []string{"applied"}}, Body: []byte(`{"messages":[{"role":"user","content":"intercepted"}]}`)}
 			},
 		},
@@ -309,6 +315,9 @@ func TestEmbeddedRuntimeExecuteResolvedAppliesInterceptorAndHostRoundTripper(t *
 	}
 	if callerMetadata["project"].(map[string]any)["id"] != "project-1" {
 		t.Fatalf("caller metadata mutated: %#v", callerMetadata)
+	}
+	if nestedMap["id"] != "project-1" || nestedPointer.Value != "original" {
+		t.Fatalf("typed caller metadata mutated: map=%#v pointer=%#v", nestedMap, nestedPointer)
 	}
 	if candidateAuth.Attributes["base_url"] != "" || candidateAuth.Attributes["egress_zone"] != "cn-east" {
 		t.Fatalf("candidate auth mutated: %#v", candidateAuth.Attributes)

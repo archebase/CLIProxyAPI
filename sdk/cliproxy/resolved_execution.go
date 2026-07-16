@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -284,19 +285,67 @@ func cloneResolvedMetadata(metadata map[string]any) map[string]any {
 }
 
 func cloneResolvedMetadataValue(value any) any {
-	switch typed := value.(type) {
-	case map[string]any:
-		return cloneResolvedMetadata(typed)
-	case []any:
-		cloned := make([]any, len(typed))
-		for index := range typed {
-			cloned[index] = cloneResolvedMetadataValue(typed[index])
+	cloned := cloneResolvedReflectValue(reflect.ValueOf(value))
+	if !cloned.IsValid() {
+		return nil
+	}
+	return cloned.Interface()
+}
+
+func cloneResolvedReflectValue(value reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return reflect.Value{}
+	}
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := cloneResolvedReflectValue(value.Elem())
+		wrapped := reflect.New(value.Type()).Elem()
+		wrapped.Set(cloned)
+		return wrapped
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := reflect.New(value.Type().Elem())
+		cloned.Elem().Set(cloneResolvedReflectValue(value.Elem()))
+		return cloned
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := reflect.MakeMapWithSize(value.Type(), value.Len())
+		iterator := value.MapRange()
+		for iterator.Next() {
+			cloned.SetMapIndex(cloneResolvedReflectValue(iterator.Key()), cloneResolvedReflectValue(iterator.Value()))
 		}
 		return cloned
-	case []string:
-		return append([]string(nil), typed...)
-	case []byte:
-		return append([]byte(nil), typed...)
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for index := 0; index < value.Len(); index++ {
+			cloned.Index(index).Set(cloneResolvedReflectValue(value.Index(index)))
+		}
+		return cloned
+	case reflect.Array:
+		cloned := reflect.New(value.Type()).Elem()
+		for index := 0; index < value.Len(); index++ {
+			cloned.Index(index).Set(cloneResolvedReflectValue(value.Index(index)))
+		}
+		return cloned
+	case reflect.Struct:
+		cloned := reflect.New(value.Type()).Elem()
+		cloned.Set(value)
+		for index := 0; index < value.NumField(); index++ {
+			if cloned.Field(index).CanSet() && value.Field(index).CanInterface() {
+				cloned.Field(index).Set(cloneResolvedReflectValue(value.Field(index)))
+			}
+		}
+		return cloned
 	default:
 		return value
 	}

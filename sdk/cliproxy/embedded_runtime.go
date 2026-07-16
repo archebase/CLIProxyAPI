@@ -34,6 +34,8 @@ type EmbeddedRuntime struct {
 	resolvedInflight int
 	resolvedDrained  chan struct{}
 	resolvedSequence atomic.Uint64
+	resolvedContext  context.Context
+	resolvedCancel   context.CancelFunc
 }
 
 const embeddedRuntimeRefreshInterval = 15 * time.Minute
@@ -54,11 +56,14 @@ func NewEmbeddedRuntime(cfg *config.Config, manager *coreauth.Manager) (*Embedde
 	manager.SetConfig(cfg)
 	manager.SetOAuthModelAlias(cfg.OAuthModelAlias)
 
+	resolvedContext, resolvedCancel := context.WithCancel(context.Background())
 	return &EmbeddedRuntime{
 		manager:            manager,
 		service:            &Service{cfg: cfg, coreManager: manager},
 		registeredAuthIDs:  make(map[string]struct{}),
 		installedExecutors: make(map[string]coreauth.ProviderExecutor),
+		resolvedContext:    resolvedContext,
+		resolvedCancel:     resolvedCancel,
 	}, nil
 }
 

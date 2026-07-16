@@ -1,6 +1,7 @@
 package translator
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -400,5 +401,26 @@ func TestPluginNormalizersChainAfterNative(t *testing.T) {
 	}
 	if hasCall(hooks.calls, "translate-request") || hasCall(hooks.calls, "translate-response") {
 		t.Fatalf("plugin translators should not run when native transformers exist, calls=%v", hooks.calls)
+	}
+}
+
+func TestTranslateNonStreamNormalizesRequestedModelWithoutNativeTransformer(t *testing.T) {
+	r := NewRegistry()
+	got := r.TranslateNonStream(context.Background(), FormatOpenAI, FormatOpenAI, "canonical-model", nil, nil, []byte(`{"id":"chatcmpl-1","model":"physical-model","choices":[]}`), nil)
+	if model := gjson.GetBytes(got, "model").String(); model != "canonical-model" {
+		t.Fatalf("model=%q body=%s", model, got)
+	}
+}
+
+func TestTranslateStreamNormalizesNestedRequestedModelAndPreservesFraming(t *testing.T) {
+	r := NewRegistry()
+	input := []byte("data: {\"type\":\"response.completed\",\"response\":{\"model\":\"physical-model\"}}\n\n")
+	got := r.TranslateStream(context.Background(), FormatOpenAIResponse, FormatOpenAIResponse, "canonical-model", nil, nil, input, nil)
+	if len(got) != 1 || !bytes.HasSuffix(got[0], []byte("\n\n")) {
+		t.Fatalf("stream framing=%q", got)
+	}
+	payload := bytes.TrimSpace(bytes.TrimPrefix(bytes.TrimSpace(got[0]), []byte("data:")))
+	if model := gjson.GetBytes(payload, "response.model").String(); model != "canonical-model" {
+		t.Fatalf("model=%q payload=%s", model, payload)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	nativeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -85,7 +86,14 @@ func (r *EmbeddedRuntime) ExecuteResolvedStream(ctx context.Context, execution R
 		execCtx, execReq, execOpts := r.prepareResolvedRequest(ctx, candidate, req, execution.Options, execution.Executor, execution.Request.Model)
 		result, errExec := executor.ExecuteStream(execCtx, candidate.Auth, execReq, execOpts)
 		if errExec == nil {
-			first, ok := <-result.Chunks
+			var first cliproxyexecutor.StreamChunk
+			var ok bool
+			select {
+			case first, ok = <-result.Chunks:
+			case <-ctx.Done():
+				finish()
+				return nil, ctx.Err()
+			}
 			if ok && first.Err != nil {
 				if resolvedRequestInvalid(first.Err) {
 					finish()
@@ -105,7 +113,17 @@ func (r *EmbeddedRuntime) ExecuteResolvedStream(ctx context.Context, execution R
 						return
 					}
 				}
-				for chunk := range result.Chunks {
+				for {
+					var chunk cliproxyexecutor.StreamChunk
+					var more bool
+					select {
+					case chunk, more = <-result.Chunks:
+						if !more {
+							return
+						}
+					case <-ctx.Done():
+						return
+					}
 					select {
 					case forwarded <- chunk:
 					case <-ctx.Done():
@@ -260,9 +278,28 @@ func cloneResolvedMetadata(metadata map[string]any) map[string]any {
 	}
 	cloned := make(map[string]any, len(metadata))
 	for key, value := range metadata {
-		cloned[key] = value
+		cloned[key] = cloneResolvedMetadataValue(value)
 	}
 	return cloned
+}
+
+func cloneResolvedMetadataValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneResolvedMetadata(typed)
+	case []any:
+		cloned := make([]any, len(typed))
+		for index := range typed {
+			cloned[index] = cloneResolvedMetadataValue(typed[index])
+		}
+		return cloned
+	case []string:
+		return append([]string(nil), typed...)
+	case []byte:
+		return append([]byte(nil), typed...)
+	default:
+		return value
+	}
 }
 
 func (r *EmbeddedRuntime) beginResolvedExecution(ctx context.Context) (context.Context, func(), error) {
@@ -287,8 +324,19 @@ func (r *EmbeddedRuntime) beginResolvedExecution(ctx context.Context) (context.C
 		return nil, nil, fmt.Errorf("cliproxy: embedded runtime is closing")
 	}
 	r.resolvedInflight++
+	runtimeContext := r.resolvedContext
 	r.resolvedMu.Unlock()
-	return ctx, r.finishResolvedExecution, nil
+	execContext, cancel := context.WithCancel(ctx)
+	stopRuntimeCancel := context.AfterFunc(runtimeContext, cancel)
+	var finishOnce sync.Once
+	finish := func() {
+		finishOnce.Do(func() {
+			stopRuntimeCancel()
+			cancel()
+			r.finishResolvedExecution()
+		})
+	}
+	return execContext, finish, nil
 }
 
 func (r *EmbeddedRuntime) finishResolvedExecution() {
@@ -304,6 +352,10 @@ func (r *EmbeddedRuntime) finishResolvedExecution() {
 func (r *EmbeddedRuntime) closeResolvedExecutions(ctx context.Context) error {
 	r.resolvedMu.Lock()
 	r.resolvedClosing = true
+	resolvedCancel := r.resolvedCancel
+	if resolvedCancel != nil {
+		resolvedCancel()
+	}
 	if r.resolvedInflight == 0 {
 		r.resolvedMu.Unlock()
 		return nil

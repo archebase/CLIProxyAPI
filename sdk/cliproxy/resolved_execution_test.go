@@ -193,14 +193,14 @@ func TestEmbeddedRuntimeExecuteResolvedDoesNotMutateGlobalModelRegistry(t *testi
 	}
 }
 
-func TestEmbeddedRuntimeCloseWaitsForResolvedStreamAndRejectsNewCalls(t *testing.T) {
-	release := make(chan struct{})
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+func TestEmbeddedRuntimeCloseCancelsAbandonedResolvedStreamAndRejectsNewCalls(t *testing.T) {
+	upstreamCanceled := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"id\":\"started\",\"choices\":[]}\n\n"))
 		w.(http.Flusher).Flush()
-		<-release
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		<-r.Context().Done()
+		close(upstreamCanceled)
 	}))
 	defer upstream.Close()
 	runtime := resolvedTestRuntime(t)
@@ -214,20 +214,21 @@ func TestEmbeddedRuntimeCloseWaitsForResolvedStreamAndRejectsNewCalls(t *testing
 	if err != nil {
 		t.Fatalf("ExecuteResolvedStream: %v", err)
 	}
-	closeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := runtime.Close(closeCtx); err == nil {
-		t.Fatal("Close returned before resolved stream drained")
+	if err := runtime.Close(closeCtx); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 	_, err = runtime.ExecuteResolved(t.Context(), ResolvedExecutionRequest{})
-	if err == nil || !strings.Contains(err.Error(), "closing") {
+	if err == nil || !strings.Contains(err.Error(), "not started") {
 		t.Fatalf("post-close-start error=%v", err)
 	}
-	close(release)
 	for range result.Chunks {
 	}
-	if err := runtime.Close(context.Background()); err != nil {
-		t.Fatalf("retry Close: %v", err)
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request was not canceled")
 	}
 }
 
@@ -263,7 +264,7 @@ func TestEmbeddedRuntimeExecuteResolvedAppliesInterceptorAndHostRoundTripper(t *
 	callerHeaders := http.Header{"X-Caller": []string{"preserved"}}
 	callerMetadata := map[string]any{
 		cliproxyexecutor.RequestedModelMetadataKey: "canonical-model",
-		"project_id": "project-1",
+		"project": map[string]any{"id": "project-1"},
 	}
 	candidateAuth := &coreauth.Auth{
 		ID:       "credential-17",
@@ -286,7 +287,7 @@ func TestEmbeddedRuntimeExecuteResolvedAppliesInterceptorAndHostRoundTripper(t *
 			Metadata:       callerMetadata,
 			RequestAfterAuthInterceptor: func(_ context.Context, input cliproxyexecutor.RequestAfterAuthInterceptRequest) cliproxyexecutor.RequestAfterAuthInterceptResponse {
 				gotIntercept = input
-				input.Metadata["project_id"] = "mutated"
+				input.Metadata["project"].(map[string]any)["id"] = "mutated"
 				return cliproxyexecutor.RequestAfterAuthInterceptResponse{Headers: http.Header{"X-Resolved-Policy": []string{"applied"}}, Body: []byte(`{"messages":[{"role":"user","content":"intercepted"}]}`)}
 			},
 		},
@@ -303,10 +304,10 @@ func TestEmbeddedRuntimeExecuteResolvedAppliesInterceptorAndHostRoundTripper(t *
 	if gotTransportAuth == nil || gotTransportAuth.ID != "credential-17" || gotTransportAuth.Metadata["tenant"] != "tenant-1" || gotTransportAuth.Attributes["egress_zone"] != "cn-east" {
 		t.Fatalf("transport auth=%#v, want original host identity and metadata", gotTransportAuth)
 	}
-	if gotIntercept.Model != "deepseek-chat" || gotIntercept.RequestedModel != "canonical-model" || gotIntercept.Metadata["project_id"] != "mutated" {
+	if gotIntercept.Model != "deepseek-chat" || gotIntercept.RequestedModel != "canonical-model" || gotIntercept.Metadata["project"].(map[string]any)["id"] != "mutated" {
 		t.Fatalf("intercept=%#v", gotIntercept)
 	}
-	if callerMetadata["project_id"] != "project-1" {
+	if callerMetadata["project"].(map[string]any)["id"] != "project-1" {
 		t.Fatalf("caller metadata mutated: %#v", callerMetadata)
 	}
 	if candidateAuth.Attributes["base_url"] != "" || candidateAuth.Attributes["egress_zone"] != "cn-east" {

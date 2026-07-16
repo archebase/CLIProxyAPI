@@ -310,6 +310,9 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 	if m == nil {
 		return
 	}
+	if PublishingSuppressed(ctx) {
+		return
+	}
 	// ensure worker is running even if Start was not called explicitly
 	m.Start(context.Background())
 	m.mu.Lock()
@@ -377,9 +380,6 @@ func RegisterNamedPlugin(name string, plugin Plugin) { DefaultManager().Register
 
 // PublishRecord publishes a record using the default manager.
 func PublishRecord(ctx context.Context, record Record) {
-	if PublishingSuppressed(ctx) {
-		return
-	}
 	DefaultManager().Publish(ctx, record)
 }
 

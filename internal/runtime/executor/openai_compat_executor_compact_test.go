@@ -106,6 +106,31 @@ func TestOpenAICompatExecutorPayloadOverrideWinsOverThinkingSuffix(t *testing.T)
 	}
 }
 
+func TestOpenAICompatExecutorNormalizesRequestedModelInResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","model":"physical-model","choices":[]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("deepseek", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
+	resp, err := executor.Execute(t.Context(), auth, cliproxyexecutor.Request{
+		Model:   "physical-model",
+		Payload: []byte(`{"model":"canonical-model","messages":[]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAI,
+		ResponseFormat: sdktranslator.FormatOpenAI,
+		Metadata:       map[string]any{cliproxyexecutor.RequestedModelMetadataKey: "canonical-model"},
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if model := gjson.GetBytes(resp.Payload, "model").String(); model != "canonical-model" {
+		t.Fatalf("response model=%q payload=%s", model, resp.Payload)
+	}
+}
+
 func TestOpenAICompatExecutorImagesGenerationsPassthrough(t *testing.T) {
 	var gotPath string
 	var gotBody []byte

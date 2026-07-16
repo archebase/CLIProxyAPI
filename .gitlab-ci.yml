@@ -1,0 +1,32 @@
+stages:
+  - verify
+
+variables:
+  GOPROXY: https://goproxy.cn,direct
+  GOFLAGS: -buildvcs=false
+
+default:
+  image: docker.m.daocloud.io/library/golang:1.26-bookworm
+  cache:
+    key: go-mod-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cache/go-build
+      - .cache/go-mod
+  before_script:
+    - export GOCACHE="$CI_PROJECT_DIR/.cache/go-build"
+    - export GOMODCACHE="$CI_PROJECT_DIR/.cache/go-mod"
+
+test:
+  stage: verify
+  script:
+    - go test ./... -count=1
+
+race-focused:
+  stage: verify
+  script:
+    - go test -race ./sdk/cliproxy ./sdk/translator ./internal/runtime/executor -count=1
+
+vet:
+  stage: verify
+  script:
+    - go vet ./...

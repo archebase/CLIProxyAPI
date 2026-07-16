@@ -23,3 +23,9 @@ jobs:
         run: |
           go build -o test-output ./cmd/server
           rm -f test-output
+      - name: Test
+        run: go test ./... -count=1
+      - name: Focused race tests
+        run: go test -race ./sdk/cliproxy ./sdk/translator ./internal/runtime/executor -count=1
+      - name: Vet
+        run: go vet ./...

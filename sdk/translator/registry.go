@@ -1,7 +1,9 @@
 package translator
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
@@ -173,6 +175,9 @@ func (r *Registry) TranslateStream(ctx context.Context, from, to Format, model s
 			outputs[i] = hooks.NormalizeResponseAfter(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, output, true)
 		}
 	}
+	for i := range outputs {
+		outputs[i] = normalizeResponseModel(outputs[i], model, true)
+	}
 	return outputs
 }
 
@@ -200,7 +205,79 @@ func (r *Registry) TranslateNonStream(ctx context.Context, from, to Format, mode
 	if hooks != nil {
 		body = hooks.NormalizeResponseAfter(ctx, from, to, model, originalRequestRawJSON, requestRawJSON, body, false)
 	}
-	return body
+	return normalizeResponseModel(body, model, false)
+}
+
+func normalizeResponseModel(body []byte, model string, stream bool) []byte {
+	model = strings.TrimSpace(model)
+	if model == "" || len(body) == 0 {
+		return body
+	}
+	if !stream {
+		return normalizeJSONResponseModel(body, model)
+	}
+	dataOffset := sseDataOffset(body)
+	if dataOffset < 0 {
+		return normalizeJSONResponseModel(body, model)
+	}
+	payloadOffset := dataOffset + len("data:")
+	for payloadOffset < len(body) && (body[payloadOffset] == ' ' || body[payloadOffset] == '\t') {
+		payloadOffset++
+	}
+	payloadEnd := len(body)
+	if lineEnd := bytes.IndexByte(body[payloadOffset:], '\n'); lineEnd >= 0 {
+		payloadEnd = payloadOffset + lineEnd
+	}
+	if payloadEnd > payloadOffset && body[payloadEnd-1] == '\r' {
+		payloadEnd--
+	}
+	for payloadEnd > payloadOffset && (body[payloadEnd-1] == ' ' || body[payloadEnd-1] == '\t') {
+		payloadEnd--
+	}
+	payload := body[payloadOffset:payloadEnd]
+	if bytes.Equal(payload, []byte("[DONE]")) {
+		return body
+	}
+	updated := normalizeJSONResponseModel(payload, model)
+	if bytes.Equal(updated, payload) {
+		return body
+	}
+	out := make([]byte, 0, len(body)-len(payload)+len(updated))
+	out = append(out, body[:payloadOffset]...)
+	out = append(out, updated...)
+	out = append(out, body[payloadEnd:]...)
+	return out
+}
+
+func sseDataOffset(body []byte) int {
+	for offset := 0; offset < len(body); {
+		lineEnd := bytes.IndexByte(body[offset:], '\n')
+		if lineEnd < 0 {
+			lineEnd = len(body) - offset
+		}
+		line := bytes.TrimSpace(body[offset : offset+lineEnd])
+		if bytes.HasPrefix(line, []byte("data:")) {
+			return offset + bytes.Index(body[offset:offset+lineEnd], []byte("data:"))
+		}
+		offset += lineEnd + 1
+	}
+	return -1
+}
+
+func normalizeJSONResponseModel(body []byte, model string) []byte {
+	if !gjson.ValidBytes(body) {
+		return body
+	}
+	updated := body
+	for _, path := range []string{"model", "response.model", "message.model"} {
+		if !gjson.GetBytes(updated, path).Exists() {
+			continue
+		}
+		if next, err := sjson.SetBytes(updated, path, model); err == nil {
+			updated = next
+		}
+	}
+	return updated
 }
 
 // TranslateTokenCount applies the registered token count response translator.

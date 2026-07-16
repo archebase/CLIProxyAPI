@@ -27,6 +27,11 @@ type EmbeddedRuntime struct {
 	registeredAuthIDs  map[string]struct{}
 	installedExecutors map[string]coreauth.ProviderExecutor
 	refreshLease       *coreauth.AutoRefreshLease
+
+	resolvedMu       sync.Mutex
+	resolvedClosing  bool
+	resolvedInflight int
+	resolvedDrained  chan struct{}
 }
 
 const embeddedRuntimeRefreshInterval = 15 * time.Minute
@@ -241,6 +246,9 @@ func (r *EmbeddedRuntime) Close(ctx context.Context) error {
 		return nil
 	}
 	r.mu.Unlock()
+	if err := r.closeResolvedExecutions(ctx); err != nil {
+		return err
+	}
 	var refreshErr error
 	if r.refreshLease != nil {
 		refreshErr = r.refreshLease.Close(ctx)
